@@ -7,54 +7,99 @@
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <header class="toolbar">
+    <div class="toolbar-inner">
+      <h1 class="brand">Portable Video Downloader</h1>
+      <div class="toolbar-actions">
+        <button id="theme-toggle" title="Toggle dark mode" class="icon-btn">🌙</button>
+        <div class="settings-menu">
+          <button id="settings-toggle" title="Settings" class="icon-btn" aria-expanded="false">⚙️</button>
+          <div class="settings-panel" id="settings-panel" hidden>
+            <h2>yt-dlp</h2>
+            <button id="update">Check for yt-dlp update</button>
+            <pre id="update-output"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <p id="error" class="error" hidden></p>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" id="tab-btn-download" data-tab="download" role="tab" aria-selected="true">
+      Download<span id="download-tab-badge" class="tab-badge" hidden></span>
+    </button>
+    <button class="tab" id="tab-btn-history" data-tab="history" role="tab" aria-selected="false">History</button>
+  </nav>
+
   <main>
-    <header class="top">
-      <h1>Portable Video Downloader</h1>
-      <button id="theme-toggle" title="Toggle dark mode">🌙</button>
-    </header>
-
-    <section class="card">
-      <label for="url">Video URL</label>
-      <div class="row">
-        <input id="url" type="text" placeholder="https://..." />
-        <button id="fetch-formats">Get formats</button>
+    <section class="tab-panel active" id="tab-download" role="tabpanel">
+      <div class="card url-card">
+        <div class="row url-row">
+          <div class="field-grow">
+            <input id="url" type="text" placeholder="Paste a video or playlist URL…" />
+          </div>
+          <label class="checkbox-row" for="is-playlist">
+            <input id="is-playlist" type="checkbox" />
+            Playlist / channel
+          </label>
+          <button id="fetch-formats">Get formats</button>
+        </div>
       </div>
-      <label class="checkbox-row" for="is-playlist">
-        <input id="is-playlist" type="checkbox" />
-        This is a playlist / channel
-      </label>
-      <label for="output-dir">Save to (optional)</label>
-      <input id="output-dir" type="text" placeholder="Default: ~/Downloads/portable-ytdlp-downloader" />
-    </section>
 
-    <section class="card" id="formats-card" hidden>
-      <p id="video-title"></p>
-      <label for="format">Format / quality</label>
-      <select id="format"></select>
-      <button id="download">Download</button>
-    </section>
+      <div id="empty-state" class="empty-state">
+        <p>Paste a video or playlist URL above and click <strong>Get formats</strong> to get started.</p>
+      </div>
 
-    <section class="card" id="progress-card" hidden>
-      <div class="progress-bar"><div id="progress-fill"></div></div>
-      <div class="row">
-        <p id="progress-text">Starting…</p>
-        <button id="cancel" class="secondary">Cancel</button>
+      <div class="card" id="formats-card" hidden>
+        <p id="video-title" class="video-title"></p>
+        <div class="row output-dir-row">
+          <div class="field-grow">
+            <label for="output-dir">Save to (optional)</label>
+            <input id="output-dir" type="text" placeholder="Default: ~/Downloads/portable-ytdlp-downloader" />
+          </div>
+          <button id="browse-folder" class="secondary">Browse…</button>
+        </div>
+        <div class="row clip-row">
+          <div class="field-grow">
+            <label for="clip-start">Clip start (optional)</label>
+            <input id="clip-start" type="text" placeholder="0:00" />
+          </div>
+          <div class="field-grow">
+            <label for="clip-end">Clip end (optional)</label>
+            <input id="clip-end" type="text" placeholder="e.g. 1:30" />
+          </div>
+        </div>
+        <p class="hint" id="clip-size-hint" hidden>
+          The size shown below is for the full video — your clip will be much smaller.
+        </p>
+        <div class="format-row">
+          <div class="field-grow">
+            <label for="format">Format / quality</label>
+            <select id="format"></select>
+          </div>
+          <button id="download" class="download-btn">Download</button>
+        </div>
+      </div>
+
+      <div class="card" id="progress-card" hidden>
+        <div class="progress-bar"><div id="progress-fill"></div></div>
+        <div class="row space-between">
+          <p id="progress-text">Starting…</p>
+          <button id="cancel" class="secondary">Cancel</button>
+        </div>
       </div>
     </section>
 
-    <section class="card">
-      <button id="update">Check for yt-dlp update</button>
-      <pre id="update-output"></pre>
-    </section>
-
-    <p id="error" class="error" hidden></p>
-
-    <section class="card">
-      <div class="row space-between">
-        <h2>History</h2>
-        <button id="clear-history" class="secondary">Clear</button>
+    <section class="tab-panel" id="tab-history" role="tabpanel">
+      <div class="card">
+        <div class="row space-between">
+          <h2>History</h2>
+          <button id="clear-history" class="secondary">Clear</button>
+        </div>
+        <ul id="history-list"></ul>
       </div>
-      <ul id="history-list"></ul>
     </section>
   </main>
   <script src="app.js"></script>
