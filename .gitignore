@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Bundled per-OS yt-dlp/ffmpeg binaries are fetched by scripts/fetch_binaries.py,
+# not committed (large, platform-specific, and yt-dlp -U rewrites them in place).
+bin/*
+!bin/.gitkeep
+ffmpeg/*
+!ffmpeg/.gitkeep
+
+# PyInstaller output
+build/
+dist/
+*.spec

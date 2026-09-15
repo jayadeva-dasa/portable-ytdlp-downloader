@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Portable Video Downloader</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>Portable Video Downloader</h1>
+
+    <section class="card">
+      <label for="url">Video URL</label>
+      <div class="row">
+        <input id="url" type="text" placeholder="https://..." />
+        <button id="fetch-formats">Get formats</button>
+      </div>
+    </section>
+
+    <section class="card" id="formats-card" hidden>
+      <p id="video-title"></p>
+      <label for="format">Format</label>
+      <select id="format"></select>
+      <button id="download">Download</button>
+    </section>
+
+    <section class="card" id="progress-card" hidden>
+      <div class="progress-bar"><div id="progress-fill"></div></div>
+      <p id="progress-text">Starting…</p>
+    </section>
+
+    <section class="card">
+      <button id="update">Check for yt-dlp update</button>
+      <pre id="update-output"></pre>
+    </section>
+
+    <p id="error" class="error" hidden></p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
