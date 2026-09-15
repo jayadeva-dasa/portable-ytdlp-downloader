@@ -13,8 +13,11 @@ import subprocess
 import threading
 import uuid
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from app.paths import get_base_dir
+
+BASE_DIR = get_base_dir()
 BIN_DIR = os.path.join(BASE_DIR, "bin")
+FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 
 _BINARY_NAMES = {
     "Windows": "yt-dlp_win.exe",
@@ -29,8 +32,16 @@ _PROGRESS_RE = re.compile(
     r"(?:\s+ETA\s+(?P<eta>[\d:]+))?"
 )
 
+QUALITY_PRESETS = {
+    "best": "bestvideo+bestaudio/best",
+    "bestvideo": "bestvideo",
+    "bestaudio": "bestaudio",
+    "worst": "worst",
+}
+
 jobs = {}
 _jobs_lock = threading.Lock()
+_processes = {}  # job_id -> subprocess.Popen, kept out of `jobs` so it never hits json.dumps
 
 
 def resolve_ytdlp_command():
@@ -43,7 +54,21 @@ def resolve_ytdlp_command():
     return ["python3", "-m", "yt_dlp"]
 
 
-def list_formats(url):
+def list_formats(url, is_playlist=False):
+    if is_playlist:
+        cmd = resolve_ytdlp_command() + ["-J", "--flat-playlist", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "yt-dlp failed to inspect this playlist")
+        info = json.loads(result.stdout)
+        entries = info.get("entries", [])
+        return {
+            "is_playlist": True,
+            "title": info.get("title") or "Playlist",
+            "entry_count": len(entries),
+            "entries": [e.get("title") for e in entries[:10]],
+        }
+
     cmd = resolve_ytdlp_command() + ["-J", "--no-playlist", url]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
@@ -61,10 +86,10 @@ def list_formats(url):
         }
         for f in info.get("formats", [])
     ]
-    return {"title": info.get("title"), "formats": formats}
+    return {"is_playlist": False, "title": info.get("title"), "formats": formats}
 
 
-def start_download(url, format_id, output_dir):
+def start_download(url, format_id, output_dir, is_playlist=False):
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         jobs[job_id] = {
@@ -75,21 +100,28 @@ def start_download(url, format_id, output_dir):
             "error": None,
             "filepath": None,
         }
-    thread = threading.Thread(target=_run_download, args=(job_id, url, format_id, output_dir), daemon=True)
+    thread = threading.Thread(
+        target=_run_download, args=(job_id, url, format_id, output_dir, is_playlist), daemon=True
+    )
     thread.start()
     return job_id
 
 
-def _run_download(job_id, url, format_id, output_dir):
+def _run_download(job_id, url, format_id, output_dir, is_playlist):
     os.makedirs(output_dir, exist_ok=True)
-    ffmpeg_dir = os.path.join(BASE_DIR, "ffmpeg")
-    cmd = resolve_ytdlp_command() + [
-        "--newline",
-        "-f", format_id or "bestvideo+bestaudio/best",
-        "-o", os.path.join(output_dir, "%(title)s.%(ext)s"),
-    ]
-    if os.path.isdir(ffmpeg_dir) and os.listdir(ffmpeg_dir):
-        cmd += ["--ffmpeg-location", ffmpeg_dir]
+
+    if is_playlist:
+        format_spec = QUALITY_PRESETS.get(format_id, QUALITY_PRESETS["best"])
+        out_template = os.path.join(output_dir, "%(playlist_title)s", "%(playlist_index)s - %(title)s.%(ext)s")
+    else:
+        format_spec = format_id or QUALITY_PRESETS["best"]
+        out_template = os.path.join(output_dir, "%(title)s.%(ext)s")
+
+    cmd = resolve_ytdlp_command() + ["--newline", "-f", format_spec, "-o", out_template]
+    if not is_playlist:
+        cmd.append("--no-playlist")
+    if os.path.isdir(FFMPEG_DIR) and os.listdir(FFMPEG_DIR):
+        cmd += ["--ffmpeg-location", FFMPEG_DIR]
     cmd.append(url)
 
     with _jobs_lock:
@@ -97,16 +129,20 @@ def _run_download(job_id, url, format_id, output_dir):
 
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        _processes[job_id] = process
         for line in process.stdout:
             _apply_progress_line(job_id, line)
         process.wait()
         with _jobs_lock:
-            if process.returncode == 0:
-                jobs[job_id]["status"] = "finished"
-                jobs[job_id]["percent"] = 100
+            job = jobs[job_id]
+            if job["status"] == "cancelled":
+                pass  # cancel_download() already set the final state
+            elif process.returncode == 0:
+                job["status"] = "finished"
+                job["percent"] = 100
             else:
-                jobs[job_id]["status"] = "error"
-                jobs[job_id]["error"] = f"yt-dlp exited with code {process.returncode}"
+                job["status"] = "error"
+                job["error"] = f"yt-dlp exited with code {process.returncode}"
     except FileNotFoundError:
         with _jobs_lock:
             jobs[job_id]["status"] = "error"
@@ -115,6 +151,23 @@ def _run_download(job_id, url, format_id, output_dir):
         with _jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = str(exc)
+    finally:
+        _processes.pop(job_id, None)
+
+
+def cancel_download(job_id):
+    process = _processes.get(job_id)
+    with _jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            return False
+        if job["status"] in ("finished", "error", "cancelled"):
+            return False
+        job["status"] = "cancelled"
+        job["error"] = "Cancelled by user"
+    if process is not None:
+        process.terminate()
+    return True
 
 
 def _apply_progress_line(job_id, line):

@@ -6,7 +6,32 @@
   --muted: #6e6e73;
   --accent: #0a84ff;
   --error: #d70015;
+  --success: #1f9d55;
   --border: #d2d2d7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1c1c1e;
+    --card: #2c2c2e;
+    --text: #f5f5f7;
+    --muted: #9a9a9e;
+    --accent: #409cff;
+    --error: #ff453a;
+    --success: #32d74b;
+    --border: #3a3a3c;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #1c1c1e;
+  --card: #2c2c2e;
+  --text: #f5f5f7;
+  --muted: #9a9a9e;
+  --accent: #409cff;
+  --error: #ff453a;
+  --success: #32d74b;
+  --border: #3a3a3c;
 }
 
 * {
@@ -26,9 +51,29 @@ main {
   padding: 2rem 1.25rem 4rem;
 }
 
+header.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.5rem;
+}
+
 h1 {
   font-size: 1.5rem;
-  margin-bottom: 1.5rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+#theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 1.1rem;
+  padding: 0.3rem 0.6rem;
 }
 
 .card {
@@ -46,9 +91,26 @@ label {
   margin-bottom: 0.4rem;
 }
 
+label.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+label.checkbox-row input {
+  width: auto;
+}
+
 .row {
   display: flex;
+  align-items: center;
   gap: 0.5rem;
+}
+
+.row.space-between {
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
 }
 
 input[type="text"],
@@ -63,6 +125,11 @@ select {
   color: inherit;
 }
 
+input[type="text"] + label,
+select + button {
+  margin-top: 0.75rem;
+}
+
 button {
   padding: 0.6rem 1rem;
   border: none;
@@ -71,6 +138,13 @@ button {
   color: white;
   font-size: 1rem;
   cursor: pointer;
+  white-space: nowrap;
+}
+
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
 }
 
 button:disabled {
@@ -97,6 +171,15 @@ button:disabled {
   transition: width 0.2s ease;
 }
 
+#progress-card .row {
+  justify-content: space-between;
+}
+
+#progress-text {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
 .error {
   color: var(--error);
   font-size: 0.9rem;
@@ -107,4 +190,55 @@ pre {
   font-size: 0.8rem;
   color: var(--muted);
   margin: 0.75rem 0 0;
+}
+
+#history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+#history-list li {
+  font-size: 0.85rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+#history-list li:last-child {
+  border-bottom: none;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.status {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  margin-right: 0.4rem;
+}
+
+.status-finished {
+  background: var(--success);
+  color: white;
+}
+
+.status-error,
+.status-cancelled {
+  background: var(--error);
+  color: white;
+}
+
+.status-starting,
+.status-downloading {
+  background: var(--accent);
+  color: white;
 }

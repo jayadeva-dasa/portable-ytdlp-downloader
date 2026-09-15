@@ -8,7 +8,10 @@
 </head>
 <body>
   <main>
-    <h1>Portable Video Downloader</h1>
+    <header class="top">
+      <h1>Portable Video Downloader</h1>
+      <button id="theme-toggle" title="Toggle dark mode">🌙</button>
+    </header>
 
     <section class="card">
       <label for="url">Video URL</label>
@@ -16,18 +19,27 @@
         <input id="url" type="text" placeholder="https://..." />
         <button id="fetch-formats">Get formats</button>
       </div>
+      <label class="checkbox-row" for="is-playlist">
+        <input id="is-playlist" type="checkbox" />
+        This is a playlist / channel
+      </label>
+      <label for="output-dir">Save to (optional)</label>
+      <input id="output-dir" type="text" placeholder="Default: ~/Downloads/portable-ytdlp-downloader" />
     </section>
 
     <section class="card" id="formats-card" hidden>
       <p id="video-title"></p>
-      <label for="format">Format</label>
+      <label for="format">Format / quality</label>
       <select id="format"></select>
       <button id="download">Download</button>
     </section>
 
     <section class="card" id="progress-card" hidden>
       <div class="progress-bar"><div id="progress-fill"></div></div>
-      <p id="progress-text">Starting…</p>
+      <div class="row">
+        <p id="progress-text">Starting…</p>
+        <button id="cancel" class="secondary">Cancel</button>
+      </div>
     </section>
 
     <section class="card">
@@ -36,6 +48,14 @@
     </section>
 
     <p id="error" class="error" hidden></p>
+
+    <section class="card">
+      <div class="row space-between">
+        <h2>History</h2>
+        <button id="clear-history" class="secondary">Clear</button>
+      </div>
+      <ul id="history-list"></ul>
+    </section>
   </main>
   <script src="app.js"></script>
 </body>
