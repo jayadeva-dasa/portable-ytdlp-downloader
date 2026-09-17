@@ -25,6 +25,15 @@ what's stale and needs re-checking before it's trusted.
 
 ## Shipped
 
+- **Automatic port fallback on launch** — `launcher.py` (`_find_open_port`)
+  probes `127.0.0.1:5000`..`5004` and binds Flask to the first free one
+  instead of crashing with "Address already in use" / "Port 5000 is in
+  use". Needed because this app's users are expected to be non-technical
+  (double-click launch, no terminal literacy assumed) and a raw port-bind
+  traceback is not actionable for them — a stale duplicate process (see
+  CLAUDE.md note 2) or an unrelated app on 5000 would otherwise block
+  launch entirely. Only tries 5 ports; if all are taken it still raises a
+  plain-language `SystemExit` rather than pretending success.
 - **MP3 extraction**, multiple bitrate tiers (best VBR, 320/256/192/128/96/64
   kbps) — `app/ytdlp_manager.py` (`MP3_FORMAT_PREFIX`, `MP3_QUALITIES`),
   `ui/app.js` (`appendMp3Options`). Requires ffmpeg (`scripts/fetch_ffmpeg.py`).
