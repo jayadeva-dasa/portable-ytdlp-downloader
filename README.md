@@ -39,6 +39,7 @@ ui/
   style.css
 scripts/
   fetch_binaries.py    # downloads per-OS yt-dlp binaries into bin/ (--current-os for CI)
+  fetch_ffmpeg.py       # downloads a static ffmpeg/ffprobe pair into ffmpeg/ (needed for MP3)
   build.py             # runs PyInstaller for the current OS -> dist/PortableVideoDownloader
 .github/workflows/
   release.yml           # builds + zips Windows/macOS/Linux and attaches to a GitHub Release
@@ -50,10 +51,25 @@ start.sh / start.bat    # dev launchers (venv + pip install + launcher.py)
 
 - **Format picker** — fetches every yt-dlp format (resolution, codec, size)
   for a single video URL.
+- **Audio only (MP3)** — an "Audio only (MP3)" group in the format dropdown
+  (single video or playlist) with multiple bitrate tiers (best VBR, 320,
+  256, 192, 128, 96, 64 kbps). Downloads the best audio stream and
+  transcodes it with `yt-dlp -x --audio-format mp3 --audio-quality <tier>`.
+  Requires an `ffmpeg` binary in `ffmpeg/` (or on `PATH` for local dev) —
+  yt-dlp can't remux to MP3 without it. Run `python3 scripts/fetch_ffmpeg.py`
+  to fetch one; without it, MP3 downloads fail after the audio download
+  finishes with an "ffprobe and ffmpeg not found" error.
+- **Clip (start/end trim)** — optional "Clip start" / "Clip end" fields
+  (plain seconds, `MM:SS`, or `HH:MM:SS`) download only that range instead
+  of the full file, via `yt-dlp --download-sections "*start-end"
+  --force-keyframes-at-cuts`. Works with any format, including MP3. Requires
+  ffmpeg, same as MP3 extraction above. Clipped files get a `[clip]` suffix
+  so they never overwrite a full download of the same title.
 - **Playlist / channel support** — a checkbox switches to `--flat-playlist`
   inspection and a quality-preset dropdown (best / best video / best audio /
-  worst), since per-video format IDs aren't consistent across a playlist.
-  Downloads land in `<output>/<playlist title>/<index> - <title>.<ext>`.
+  worst / MP3), since per-video format IDs aren't consistent across a
+  playlist. Downloads land in
+  `<output>/<playlist title>/<index> - <title>.<ext>`.
 - **Live progress bar** — Server-Sent Events stream percent/speed/ETA parsed
   from yt-dlp's own `--newline` output.
 - **Cancel** — terminates the in-flight yt-dlp subprocess mid-download.
@@ -70,6 +86,7 @@ start.sh / start.bat    # dev launchers (venv + pip install + launcher.py)
 
 ```bash
 python3 scripts/fetch_binaries.py   # optional — falls back to `python3 -m yt_dlp` if skipped
+python3 scripts/fetch_ffmpeg.py     # optional — only needed for MP3 downloads
 ./start.sh                          # macOS/Linux
 start.bat                           # Windows
 ```
@@ -82,8 +99,10 @@ This creates a venv, installs `requirements.txt`, and opens
 - `GET /api/formats?url=<video url>&playlist=1` — returns the video/playlist
   title and available formats (or quality presets + entry count for a
   playlist).
-- `POST /api/download` — body `{ url, format_id, output_dir?, is_playlist? }`,
-  returns `{ job_id }` and starts the download in a background thread.
+- `POST /api/download` — body
+  `{ url, format_id, output_dir?, is_playlist?, clip_start?, clip_end? }`,
+  returns `{ job_id, output_dir }` and starts the download in a background
+  thread.
 - `POST /api/cancel/<job_id>` — terminates that job's subprocess.
 - `GET /api/progress/<job_id>` — Server-Sent Events stream of
   `{ status, percent, speed, eta, error }` until the job finishes, errors,
@@ -98,6 +117,7 @@ PyInstaller does not cross-compile — run this on each target OS:
 ```bash
 pip install -r requirements.txt -r requirements-build.txt
 python scripts/fetch_binaries.py --current-os
+python scripts/fetch_ffmpeg.py      # optional — bundles MP3 support into the release
 python scripts/build.py
 ```
 
