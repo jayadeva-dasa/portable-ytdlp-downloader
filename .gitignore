@@ -16,3 +16,8 @@ dist/
 
 # Debug log written by app/ytdlp_manager.py's _log()
 logs/
+
+# Local test downloads and scratch command notes, not project artifacts
+*.mp3
+*.mp4
+cmd.txt
