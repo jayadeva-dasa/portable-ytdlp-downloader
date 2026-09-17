@@ -81,30 +81,96 @@ confusing debugging detour in this repo's history (see
    itself, not yt-dlp's own downloader.** Confirmed for HLS-only 4K
    formats (e.g. itag 625) and past-livestream VODs regardless of quality:
    yt-dlp logs `Invoking ffmpeg downloader on ...` and ffmpeg does the
-   actual transfer directly (`-ss/-t/-i <url>`). That path never prints a
-   `[download] NN%` line by default, but it *can* report real progress -
-   `_run_download_inner` passes `--downloader-args "ffmpeg_o:-progress
-   pipe:1 -nostats"` for clip downloads, and `_apply_progress_line` turns
-   the resulting `out_time=` lines into a percent (`_FFMPEG_OUT_TIME_RE`) -
-   but only when both `clip_start` and `clip_end` are set, since that's
-   what makes the clip's total duration known. For an open-ended clip (only
-   one of the two set) or a non-clip download of this format type, no
-   percent is available and the frontend's stall timer
-   (`DOWNLOAD_STALL_MS` in `ui/app.js`) covers the UI side instead. This
+   actual transfer directly. That path never prints a `[download] NN%`
+   line, so `job["percent"]` doesn't move for the whole transfer — the
+   frontend's stall timer (`DOWNLOAD_STALL_MS` in `ui/app.js`) covers this
+   by switching to an indeterminate spinner instead of looking hung. This
    also means `cancel_download()` must kill the whole process tree, not
    just the yt-dlp PID (`_kill_process_tree` in `app/ytdlp_manager.py`) —
    the ffmpeg child doesn't die with its parent otherwise.
-10. **Clipping a merged (video+audio) format normally forces
-    `--merge-output-format mp4`, which on HLS-only formats (VP9/Opus
-    source) means a full CPU-bound re-encode to H.264/AAC.** For
-    `want_clip and is_merge` (`fast_clip` in `_run_download_inner`), that
-    forced MP4 and `--force-keyframes-at-cuts` are both skipped so ffmpeg
-    can stream-copy instead — faster and lossless, but the cut lands on the
-    nearest keyframe rather than the exact requested second, and the
-    output stays in its native container (`.webm`/`.mkv`) instead of
-    `.mp4`. Measured: the speed gain from this alone is modest — for a deep
-    clip, network/seek time within the HLS stream dominates over the
-    encode, not the other way round.
+10. **Clip/trim downloads always use one instant, stream-copy method,
+    regardless of format — there is no re-encode/frame-exact variant.**
+    `_run_download_inner` never asks yt-dlp to cut during the download
+    itself; it always downloads the complete video first (normal
+    `[download] NN%` progress throughout, to a temp filename tagged with
+    `_FULL_DOWNLOAD_MARKER`), then `_trim_clip` runs one local `ffmpeg -ss
+    <start> -to <end> -i <full file> -c copy <final file>` and deletes the
+    temp full download. Fast (no re-encode), but the cut lands on the
+    nearest keyframe rather than the exact requested second, and — being a
+    raw stream copy — it inherits whatever bitstream issues already exist
+    in the source: past-livestream VODs recorded over HLS can carry small
+    pre-existing NAL-framing corruption at segment-splice points (invisible
+    during normal playback, since players silently conceal a bad frame, but
+    caught loudly by ffmpeg's strict `-c copy` demuxer as "Invalid NAL unit
+    size" with visibly missing frames in the trimmed output — nothing to do
+    with this app's merge/download logic). Playlists ignore
+    `clip_start`/`clip_end` entirely (no single output file to trim). Every
+    clip request logs its phase-1 (download) command, the yt-dlp
+    `Destination:`/`Merging formats into` lines it derives `job["filepath"]`
+    from, and its phase-2 (trim) ffmpeg command/output to
+    `logs/ytdlp_manager.log` (`_log()` in `app/ytdlp_manager.py`, gitignored,
+    created on first use).
+11. **yt-dlp silently drops characters from the filenames it *prints*
+    (fullwidth punctuation, CJK, etc.) when its stdout is piped rather than
+    a real console — independent of `PYTHONIOENCODING`/`PYTHONUTF8` (tried
+    and confirmed to make no difference) — while still writing the real
+    Unicode filename to disk.** Confirmed by direct testing against a title
+    containing `：`/`｜` (fullwidth colon/vertical bar): the `Destination:`/
+    `Merging formats into` lines this app parses to find the just-downloaded
+    file had those characters missing entirely, producing a plausible-looking
+    but wrong path — surfacing as "Download finished but the output file
+    couldn't be found" on an otherwise fully successful clip download. Fix:
+    `_find_full_download()` in `app/ytdlp_manager.py` never trusts that
+    printed path alone for a clip request — if it doesn't exist, it falls
+    back to scanning `output_dir` for the one file containing
+    `_FULL_DOWNLOAD_MARKER` (an `os.listdir()` call sees the real filename
+    correctly regardless of this printing quirk). The same risk applies to a
+    regular (non-clip, non-playlist) download's `job["filepath"]`, which is
+    parsed the same way — `_run_download_inner` verifies it with
+    `os.path.isfile()` after the download finishes and, if missing, falls
+    back to `_find_recent_download()` (the one file in `output_dir` modified
+    at/after the download started; ambiguous — zero or multiple matches —
+    still returns `None` rather than guessing wrong, since there's no
+    `_FULL_DOWNLOAD_MARKER`-style tag to search for outside the clip path).
+    Playlists are skipped (many files land in `output_dir` per run, so a
+    newest-file guess isn't reliable). History's reveal-in-folder
+    (`revealHistoryEntry` in `ui/app.js`, `POST /api/reveal`) is the main
+    consumer of `job["filepath"]` for a finished job, and shows a clear
+    "couldn't be found" message rather than a generic error if this
+    fallback still can't resolve a real file. Any future code that needs a
+    just-downloaded filename from yt-dlp's stdout should assume the same
+    risk for non-ASCII titles.
+12. **On Windows, `explorer /select,<path>` silently opens some unrelated
+    default folder (confirmed: the user's Documents folder) instead of
+    erroring, whenever `path` contains a space** — which is nearly every
+    real video title, so this hit essentially every "show in folder" click,
+    not an edge case. Root cause: `subprocess.run(["explorer",
+    f"/select,{path}"])` passes `/select,` and `path` as one combined argv
+    element; since Python's `subprocess.list2cmdline` wraps that whole
+    element in quotes as soon as it contains whitespace, explorer receives
+    `explorer "/select,C:\Some Folder\file.mp4"` — and explorer's own
+    hand-rolled command-line parsing for `/select,` (it does not use
+    standard `CommandLineToArgvW` argument splitting) can't handle the
+    combined quoting and falls back to a default location instead of
+    erroring, which is what made this so easy to miss in testing. Confirmed
+    empirically (not just by inspection) via PowerShell's `Shell.Application`
+    COM object to read the actually-opened window's `LocationURL`/
+    `SelectedItems()` before and after the fix — no human needed to look at
+    a screen to verify this one. Fix in `reveal_in_file_manager()`
+    (`app/dialogs.py`): pass `/select,` and the path as two separate argv
+    elements (`["explorer", "/select,", path]`) — neither element alone
+    triggers the broken combined-quoting case — and `os.path.normpath()`
+    the path first, since this app can also hand explorer a path with mixed
+    forward/backslashes (e.g. an output dir from the folder-browse dialog,
+    which returns forward slashes, with `os.path.join`-ed backslash path
+    separators appended by yt-dlp's own output template) that explorer's
+    parser has also been seen to mishandle. `reveal_in_file_manager()` now
+    logs every reveal request's path and the exact command run to
+    `logs/dialogs.log` (gitignored, mirrors the `_log()` pattern in
+    `app/ytdlp_manager.py`) — check there first if "show in folder" ever
+    opens the wrong place again, since explorer.exe returns exit code 1 on
+    an entirely normal, successful `/select,` call, so the subprocess return
+    code alone can't tell success from failure here.
 
 ## Keep this file and IMPLEMENTATION_PLAN.md updated
 

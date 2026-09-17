@@ -5,6 +5,7 @@ yt_dlp as a Python library because only the standalone release binary
 supports `yt-dlp -U` self-update in place. That's also why the bundled
 binary always wins over any fallback here.
 """
+import datetime
 import json
 import os
 import platform
@@ -13,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import uuid
 
 from app.paths import get_base_dir
@@ -20,6 +22,23 @@ from app.paths import get_base_dir
 BASE_DIR = get_base_dir()
 BIN_DIR = os.path.join(BASE_DIR, "bin")
 FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
+LOG_FILE = os.path.join(BASE_DIR, "logs", "ytdlp_manager.log")
+
+
+def _log(job_id, message):
+    """Best-effort debug log for the clip download pipeline - specifically
+    for diagnosing "output file couldn't be found"-class failures, where the
+    job's own `error` field alone isn't enough to tell whether yt-dlp never
+    printed a usable path, printed one that doesn't match what's actually on
+    disk, or something else. Never raises - a logging failure must not take
+    down a download."""
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] [{job_id}] {message}\n")
+    except OSError:
+        pass
 
 _BINARY_NAMES = {
     "Windows": "yt-dlp_win.exe",
@@ -41,18 +60,6 @@ _PROGRESS_RE = re.compile(
 # the last "Destination:", is the one whose path actually still exists on
 # disk once the download is done.
 _MERGE_RE = re.compile(r'Merging formats into "(?P<path>.+)"')
-
-# Matches one line of ffmpeg's "-progress pipe:1" output (see the
-# "--downloader-args ffmpeg_o:..." flag added for clip downloads on
-# HLS-only formats): "out_time=00:00:15.000000". Deliberately not
-# out_time_us/out_time_ms - some ffmpeg builds report those in
-# microseconds despite the "_ms" name, while out_time is an unambiguous
-# timestamp string (and occasionally "N/A", which this simply won't match).
-_FFMPEG_OUT_TIME_RE = re.compile(r"^out_time=(?P<hours>\d+):(?P<mins>\d{2}):(?P<secs>\d{2}(?:\.\d+)?)$")
-
-
-def _parse_ffmpeg_timestamp(match):
-    return int(match.group("hours")) * 3600 + int(match.group("mins")) * 60 + float(match.group("secs"))
 
 QUALITY_PRESETS = {
     "best": "bestvideo+bestaudio/best",
@@ -159,7 +166,9 @@ def _run_ytdlp_json(cmd, timeout, context):
     message doesn't mention yt-dlp at all. `context` is a short phrase like
     "this URL" or "this playlist" used in the timeout/not-found messages."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Timed out inspecting {context} (waited {timeout}s)")
     except FileNotFoundError:
@@ -172,163 +181,61 @@ def _run_ytdlp_json(cmd, timeout, context):
         raise RuntimeError(f"yt-dlp returned unparseable output for {context}: {exc}") from exc
 
 
-# Marks the temp file produced by phase 1 of an HLS clip download (see
-# _run_hls_clip_download) so phase 2 can reliably derive the final clip
-# filename from it and so a crash-interrupted temp file is recognizable if
-# ever found on disk later.
+# Marks the temp file produced by the plain full download for a clip
+# request, so the post-download trim step can reliably derive the final
+# clip filename from it and a crash-interrupted temp file is recognizable
+# if ever found on disk later.
 _FULL_DOWNLOAD_MARKER = " [full download - temp]"
 
 
-def _is_hls_format(url, format_spec):
-    """True if any concrete format_id referenced by `format_spec` (e.g.
-    "625+bestaudio/best" -> "625") is HLS-sourced (protocol starting with
-    "m3u8"). HLS-sourced *video* is what forces yt-dlp to hand
-    --download-sections off to a raw ffmpeg process seeking deep into the
-    live network stream instead of fetching just the needed byte range -
-    confirmed by direct testing (see "Fixed clip downloads on HLS-only
-    formats" in IMPLEMENTATION_PLAN.md). Audio-only components (bestaudio,
-    a plain numeric audio format_id) are never the bottleneck - YouTube
-    serves those over plain HTTP even when the video track is HLS - so
-    generic preset keywords like "bestaudio"/"best" simply won't match
-    anything in `by_id` and are correctly ignored. Returns False (falls
-    back to the direct-section path) if the lookup itself fails - this is
-    an optimization, not a correctness requirement."""
+def _find_full_download(output_dir):
+    """Locates the just-finished full download for a clip request by
+    scanning output_dir for a name containing _FULL_DOWNLOAD_MARKER, instead
+    of trusting the path yt-dlp printed to stdout for the "Destination:"/
+    "Merging formats into" lines _apply_progress_line parses. Confirmed by
+    direct testing: yt-dlp silently drops characters its *printed* status
+    lines can't represent in some detected "safe" encoding (fullwidth
+    punctuation, CJK, etc.) when stdout is piped rather than a real console
+    - independent of the PYTHONIOENCODING/PYTHONUTF8 env vars, which made no
+    difference in testing - while still writing the real Unicode filename to
+    disk (Windows file I/O is Unicode-safe regardless). That mismatch is
+    what produced "Download finished but the output file couldn't be found"
+    for titles with such characters even though the download succeeded.
+    `os.listdir` doesn't go through any of that printing/encoding logic, so
+    it always sees the real name. Returns None if zero or more than one
+    match is found (nothing to safely pick)."""
     try:
-        cmd = resolve_ytdlp_command() + ["-J", "--no-playlist", url]
-        info = _run_ytdlp_json(cmd, timeout=60, context="this URL")
-    except RuntimeError:
-        return False
-    by_id = {f.get("format_id"): f for f in info.get("formats", [])}
-    format_ids = format_spec.split("+") if isinstance(format_spec, str) else []
-    return any((by_id.get(fid) or {}).get("protocol", "").startswith("m3u8") for fid in format_ids)
-
-
-def _run_hls_clip_download(job_id, url, format_spec, output_dir, is_merge, clip_start, clip_end, clip_suffix):
-    """Downloads the full video (yt-dlp's own efficient downloader - real
-    "[download] NN%" progress, no deep network seeking) and then trims the
-    requested clip locally with a stream-copy ffmpeg call. User-chosen
-    trade-off for HLS-only formats (4K, past-livestream VODs) after
-    diagnosing that seeking directly into the remote HLS stream (the
-    previous approach) is what made these clips take minutes: uses far more
-    bandwidth/disk (the whole video, not just the clip's slice) but avoids
-    the slow/unreliable deep seek entirely - a local trim only takes as
-    long as it takes to mux, typically seconds."""
-    full_template = os.path.join(output_dir, f"%(title)s{_FULL_DOWNLOAD_MARKER}.%(ext)s")
-    cmd = resolve_ytdlp_command() + [
-        "--newline",
-        "-f", format_spec,
-        "-o", full_template,
-        "--file-access-retries", "10",
-        "--retry-sleep", "file_access:exp=1:20",
-        "--no-playlist",
-    ]
-    if is_merge:
-        cmd += ["--merge-output-format", "mp4"]
-    if os.path.isdir(FFMPEG_DIR) and os.listdir(FFMPEG_DIR):
-        cmd += ["--ffmpeg-location", FFMPEG_DIR]
-    cmd.append(url)
-
-    with _jobs_lock:
-        jobs[job_id]["status"] = "downloading"
-
-    output_lines = []
-    try:
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True
-        )
-        _processes[job_id] = process
-        for line in process.stdout:
-            output_lines.append(line.rstrip("\n"))
-            _apply_progress_line(job_id, line)
-        process.wait()
-    except FileNotFoundError:
-        with _jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = "yt-dlp binary not found (run scripts/fetch_binaries.py or install the yt-dlp package)"
-        return
-    except Exception as exc:
-        with _jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = str(exc)
-        return
-    finally:
-        _processes.pop(job_id, None)
-
-    with _jobs_lock:
-        job = jobs[job_id]
-        if job["status"] == "cancelled":
-            return  # cancel_download() already set the final state
-        if process.returncode != 0:
-            job["status"] = "error"
-            job["error"] = _extract_error_message(output_lines) or f"yt-dlp exited with code {process.returncode}"
-            return
-        full_path = job["filepath"]
-
-    if not full_path or not os.path.isfile(full_path):
-        with _jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = "Download finished but the output file couldn't be found"
-        return
-
-    base, ext = os.path.splitext(full_path)
-    if base.endswith(_FULL_DOWNLOAD_MARKER):
-        base = base[: -len(_FULL_DOWNLOAD_MARKER)]
-    final_path = f"{base}{clip_suffix}{ext}"
-
-    with _jobs_lock:
-        jobs[job_id]["status"] = "clipping"
-        jobs[job_id]["percent"] = 100
-        jobs[job_id]["speed"] = None
-        jobs[job_id]["eta"] = None
-
-    ffmpeg_bin = os.path.join(FFMPEG_DIR, "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg")
-    if not os.path.isfile(ffmpeg_bin):
-        ffmpeg_bin = "ffmpeg"  # fall back to PATH
-    start_seconds = _clip_seconds(clip_start) if clip_start else 0
-    trim_cmd = [ffmpeg_bin, "-y", "-ss", str(start_seconds)]
-    if clip_end:
-        trim_cmd += ["-t", str(_clip_seconds(clip_end) - start_seconds)]
-    trim_cmd += ["-i", full_path, "-c", "copy", final_path]
-
-    trim_output_lines = []
-    try:
-        process = subprocess.Popen(
-            trim_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True
-        )
-        _processes[job_id] = process
-        for line in process.stdout:
-            trim_output_lines.append(line.rstrip("\n"))
-        process.wait()
-    except Exception as exc:
-        with _jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = f"Local clip trim failed: {exc}. The full download is kept at {full_path}"
-        return
-    finally:
-        _processes.pop(job_id, None)
-
-    with _jobs_lock:
-        job = jobs[job_id]
-        if job["status"] == "cancelled":
-            return
-        if process.returncode != 0:
-            job["status"] = "error"
-            job["error"] = (
-                f"Local clip trim failed (exit {process.returncode}). "
-                f"The full download is kept at {full_path}: "
-                + (trim_output_lines[-1].strip() if trim_output_lines else "")
-            )
-            return
-        job["status"] = "finished"
-        job["percent"] = 100
-        job["filepath"] = final_path
-
-    # Best-effort - the clip is already written and correct either way, so a
-    # locked/undeletable temp file (e.g. still scanned by AV) isn't fatal.
-    try:
-        os.remove(full_path)
+        candidates = [
+            os.path.join(output_dir, name)
+            for name in os.listdir(output_dir)
+            if _FULL_DOWNLOAD_MARKER in name
+        ]
     except OSError:
-        pass
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _find_recent_download(output_dir, since_ts):
+    """Same fallback as _find_full_download, for a *regular* (non-clip)
+    single-video download whose parsed Destination:/Merging-formats path
+    doesn't exist on disk - same root cause (yt-dlp drops non-ASCII/fullwidth
+    characters from its *printed* status lines independent of the real
+    filename it writes to disk, see CLAUDE.md note 11), but there's no
+    _FULL_DOWNLOAD_MARKER to search for here. Falls back to the one file in
+    output_dir modified at/after the download started; ambiguous (zero or
+    more than one match) returns None rather than guessing wrong - History's
+    "reveal in folder" then reports the file as not found instead of
+    pointing at some other unrelated file."""
+    try:
+        candidates = [
+            path
+            for name in os.listdir(output_dir)
+            if os.path.isfile(path := os.path.join(output_dir, name))
+            and os.path.getmtime(path) >= since_ts
+        ]
+    except OSError:
+        return None
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def list_formats(url, is_playlist=False):
@@ -426,7 +333,9 @@ def _run_download_inner(job_id, url, format_id, output_dir, is_playlist, clip_st
 
     want_mp3 = isinstance(format_id, str) and format_id.startswith(MP3_FORMAT_PREFIX)
     mp3_quality = MP3_QUALITIES.get(format_id[len(MP3_FORMAT_PREFIX):], "0") if want_mp3 else None
-    want_clip = bool(clip_start or clip_end)
+    # Clipping a playlist has no single output file to trim, so clip_start/
+    # clip_end are simply ignored when is_playlist is set.
+    want_clip = bool(clip_start or clip_end) and not is_playlist
     # Must include the actual range, not just a bare " [clip]" tag - otherwise
     # two clip downloads of the same title with different start/end (a very
     # normal thing to do while trimming to find the right range) collide on
@@ -443,29 +352,19 @@ def _run_download_inner(job_id, url, format_id, output_dir, is_playlist, clip_st
     if is_playlist:
         format_spec = "bestaudio/best" if want_mp3 else QUALITY_PRESETS.get(format_id, QUALITY_PRESETS["best"])
         out_template = os.path.join(
-            output_dir, "%(playlist_title)s", f"%(playlist_index)s - %(title)s{clip_suffix}.%(ext)s"
+            output_dir, "%(playlist_title)s", "%(playlist_index)s - %(title)s.%(ext)s"
         )
     else:
         format_spec = "bestaudio/best" if want_mp3 else (format_id or QUALITY_PRESETS["best"])
-        out_template = os.path.join(output_dir, f"%(title)s{clip_suffix}.%(ext)s")
+        # A clip request downloads the complete video to a temp name first
+        # (see _FULL_DOWNLOAD_MARKER) and trims it locally afterwards in
+        # _trim_clip - simpler and more reliable than asking yt-dlp/ffmpeg to
+        # seek and cut mid-download (see IMPLEMENTATION_PLAN.md).
+        out_template = os.path.join(
+            output_dir, f"%(title)s{_FULL_DOWNLOAD_MARKER if want_clip else ''}.%(ext)s"
+        )
 
     is_merge = format_id in MP4_MERGE_FORMAT_IDS or (isinstance(format_id, str) and "+" in format_id)
-
-    # Clipping an HLS-sourced format normally means yt-dlp seeking deep into
-    # the *live network stream* via a raw ffmpeg-as-downloader process,
-    # which measured minutes and could even fail outright (TLS handshake
-    # timeouts talking to Google's manifest server - see "Fixed downloads
-    # silently stalling"/"Fixed clip downloads on HLS-only formats" in
-    # IMPLEMENTATION_PLAN.md). User-chosen trade-off after that diagnosis:
-    # download the full video with yt-dlp's normal (fast, reliable)
-    # downloader, then trim locally - see _run_hls_clip_download. Skipped
-    # for playlists (format specs there are presets like "bestvideo+bestaudio",
-    # not concrete IDs _is_hls_format can resolve) and MP3 extraction
-    # (audio-only; YouTube serves audio over plain HTTP even when the video
-    # track is HLS, so it was never the slow part).
-    if want_clip and not want_mp3 and not is_playlist and _is_hls_format(url, format_spec):
-        _run_hls_clip_download(job_id, url, format_spec, output_dir, is_merge, clip_start, clip_end, clip_suffix)
-        return
 
     cmd = resolve_ytdlp_command() + [
         "--newline",
@@ -478,33 +377,10 @@ def _run_download_inner(job_id, url, format_id, output_dir, is_playlist, clip_st
         "--file-access-retries", "10",
         "--retry-sleep", "file_access:exp=1:20",
     ]
-    # Clipping a merged video+audio format normally forces the pieces into
-    # MP4 via --merge-output-format, which (for a non-HLS source that still
-    # needs a codec conversion to fit) can mean a slower re-encode. Skipping
-    # the forced MP4 (and --force-keyframes-at-cuts, which forces its own
-    # re-encode) lets ffmpeg stream-copy instead where possible - at the
-    # cost of the cut landing on the nearest keyframe rather than the exact
-    # requested second, and the output staying in its native container
-    # (webm/mkv, via %(ext)s) instead of always .mp4. Only the non-HLS path
-    # still reaches here - see the HLS branch above for the other case.
-    fast_clip = want_clip and is_merge
     if want_mp3:
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", mp3_quality]
-    elif is_merge and not fast_clip:
+    elif is_merge:
         cmd += ["--merge-output-format", "mp4"]
-    if want_clip:
-        cmd += ["--download-sections", f"*{clip_start or '0'}-{clip_end or 'inf'}"]
-        if not fast_clip:
-            cmd.append("--force-keyframes-at-cuts")
-        # Some non-HLS section downloads still route through ffmpeg as an
-        # external downloader too (not just the HLS case above), and that
-        # path never prints a "[download] NN%" line at all. Asking ffmpeg
-        # itself for machine-readable progress (verified against the real
-        # binary: clean newline-terminated "out_time=HH:MM:SS.ffffff" /
-        # "progress=..." lines, doesn't affect the download) lets
-        # _apply_progress_line compute a real percent instead of leaving the
-        # UI on a bare "waiting for data" spinner for however long it takes.
-        cmd += ["--downloader-args", "ffmpeg_o:-progress pipe:1 -nostats"]
     if not is_playlist:
         cmd.append("--no-playlist")
     if os.path.isdir(FFMPEG_DIR) and os.listdir(FFMPEG_DIR):
@@ -518,27 +394,26 @@ def _run_download_inner(job_id, url, format_id, output_dir, is_playlist, clip_st
     # lines; once those stop (the file itself is fully fetched) and yt-dlp
     # moves on to ffmpeg post-processing, surface *what* that post-processing
     # step is doing instead of leaving the UI stuck on "downloading — 100%".
-    # Priority mirrors what a clip request actually goes through: the section
-    # gets trimmed first, then (if requested) the trimmed file is converted.
-    post_status = "clipping" if want_clip else "converting" if want_mp3 else "merging" if is_merge else None
+    post_status = "converting" if want_mp3 else "merging" if is_merge else None
 
-    # Only computable when both ends of the clip are given - needed to turn
-    # the ffmpeg-as-downloader "out_time=" lines above into a percent.
-    clip_duration = (
-        _clip_seconds(clip_end) - _clip_seconds(clip_start)
-        if clip_start and clip_end
-        else None
-    )
+    if want_clip:
+        _log(job_id, f"phase1 cmd: {cmd}")
 
     output_lines = []
+    filepath_lines = []
     download_started = False
     post_status_applied = False
+    # Small buffer for filesystem mtime resolution (some filesystems truncate
+    # to whole seconds) - used by _find_recent_download's fallback below.
+    started_at = time.time() - 2
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             # Puts yt-dlp in its own process group so cancel_download() can
             # kill it *and* any ffmpeg child it spawns together - see
@@ -548,7 +423,9 @@ def _run_download_inner(job_id, url, format_id, output_dir, is_playlist, clip_st
         _processes[job_id] = process
         for line in process.stdout:
             output_lines.append(line.rstrip("\n"))
-            is_progress = _apply_progress_line(job_id, line, clip_duration)
+            if want_clip and ("Destination:" in line or "Merging formats into" in line):
+                filepath_lines.append(line.strip())
+            is_progress = _apply_progress_line(job_id, line)
             if is_progress:
                 download_started = True
             elif download_started and not post_status_applied and post_status and line.strip():
@@ -558,28 +435,148 @@ def _run_download_inner(job_id, url, format_id, output_dir, is_playlist, clip_st
                         job["status"] = post_status
                 post_status_applied = True
         process.wait()
-        with _jobs_lock:
-            job = jobs[job_id]
-            if job["status"] == "cancelled":
-                pass  # cancel_download() already set the final state
-            elif process.returncode == 0:
-                job["status"] = "finished"
-                job["percent"] = 100
-            else:
-                job["status"] = "error"
-                job["error"] = _extract_error_message(output_lines) or (
-                    f"yt-dlp exited with code {process.returncode}"
-                )
     except FileNotFoundError:
         with _jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = "yt-dlp binary not found (run scripts/fetch_binaries.py or install the yt-dlp package)"
+        return
     except Exception as exc:  # subprocess/IO failures during the download
         with _jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = str(exc)
+        return
     finally:
         _processes.pop(job_id, None)
+
+    with _jobs_lock:
+        job = jobs[job_id]
+        if job["status"] == "cancelled":
+            return  # cancel_download() already set the final state
+        if process.returncode != 0:
+            job["status"] = "error"
+            job["error"] = _extract_error_message(output_lines) or f"yt-dlp exited with code {process.returncode}"
+            return
+        full_path = job["filepath"]
+
+    if not want_clip:
+        # Same non-ASCII-title printing quirk the clip path already works
+        # around (CLAUDE.md note 11) can leave a regular download's parsed
+        # path wrong too - verify it and fall back to a directory scan
+        # *before* marking finished, so History's "reveal in folder" has a
+        # path that actually exists. Skipped for playlists: multiple files
+        # land in output_dir per run, so a single-newest-file guess would be
+        # unreliable - job["filepath"] just keeps whatever the last parsed
+        # line said, same as before this change.
+        if (not full_path or not os.path.isfile(full_path)) and not is_playlist:
+            full_path = _find_recent_download(output_dir, started_at) or full_path
+        with _jobs_lock:
+            job = jobs[job_id]
+            job["status"] = "finished"
+            job["percent"] = 100
+            job["filepath"] = full_path
+        return
+
+    _log(job_id, f"phase1 returncode=0 job_filepath={full_path!r} filepath_lines={filepath_lines}")
+
+    if not full_path or not os.path.isfile(full_path):
+        # The parsed path can be wrong for titles with characters yt-dlp
+        # drops from its own printed status lines (see _find_full_download) -
+        # fall back to finding the real file on disk before giving up.
+        fallback_path = _find_full_download(output_dir)
+        _log(job_id, f"parsed path missing, directory-scan fallback found: {fallback_path!r}")
+        if fallback_path:
+            full_path = fallback_path
+
+    if not full_path or not os.path.isfile(full_path):
+        try:
+            dir_listing = os.listdir(output_dir)
+        except OSError as exc:
+            dir_listing = [f"<error listing {output_dir!r}: {exc}>"]
+        _log(job_id, f"filepath not found: expected={full_path!r} output_dir_listing={dir_listing}")
+        with _jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = (
+                f"Download finished but the output file couldn't be found (expected {full_path!r}). "
+                f"See logs/ytdlp_manager.log for details."
+            )
+        return
+
+    _trim_clip(job_id, full_path, clip_start, clip_end, clip_suffix)
+
+
+def _trim_clip(job_id, full_path, clip_start, clip_end, clip_suffix):
+    """Cuts [clip_start, clip_end) out of the just-downloaded full_path with a
+    single stream-copy ffmpeg call: instant (no re-encode), at the cost of the
+    cut landing on the nearest keyframe rather than the exact requested
+    second."""
+    base, ext = os.path.splitext(full_path)
+    if base.endswith(_FULL_DOWNLOAD_MARKER):
+        base = base[: -len(_FULL_DOWNLOAD_MARKER)]
+    final_path = f"{base}{clip_suffix}{ext}"
+
+    with _jobs_lock:
+        jobs[job_id]["status"] = "clipping"
+        jobs[job_id]["percent"] = 100
+        jobs[job_id]["speed"] = None
+        jobs[job_id]["eta"] = None
+
+    ffmpeg_bin = os.path.join(FFMPEG_DIR, "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg")
+    if not os.path.isfile(ffmpeg_bin):
+        ffmpeg_bin = "ffmpeg"  # fall back to PATH
+    # -ss/-to placed before -i (input seeking) so ffmpeg jumps straight to
+    # the start point instead of demuxing everything before it - much faster
+    # on a long video, and still works with -c copy.
+    trim_cmd = [ffmpeg_bin, "-y"]
+    if clip_start:
+        trim_cmd += ["-ss", clip_start]
+    if clip_end:
+        trim_cmd += ["-to", clip_end]
+    trim_cmd += ["-i", full_path, "-c", "copy", final_path]
+    _log(job_id, f"trim cmd: {trim_cmd}")
+
+    trim_output_lines = []
+    try:
+        process = subprocess.Popen(
+            trim_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
+        )
+        _processes[job_id] = process
+        for line in process.stdout:
+            trim_output_lines.append(line.rstrip("\n"))
+        process.wait()
+    except Exception as exc:
+        _log(job_id, f"trim raised: {exc}")
+        with _jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = f"Clip trim failed: {exc}. The full download is kept at {full_path}"
+        return
+    finally:
+        _processes.pop(job_id, None)
+
+    _log(job_id, f"trim returncode={process.returncode} last_lines={trim_output_lines[-15:]}")
+
+    with _jobs_lock:
+        job = jobs[job_id]
+        if job["status"] == "cancelled":
+            return
+        if process.returncode != 0:
+            job["status"] = "error"
+            job["error"] = (
+                f"Clip trim failed (exit {process.returncode}). "
+                f"The full download is kept at {full_path}: "
+                + (trim_output_lines[-1].strip() if trim_output_lines else "")
+            )
+            return
+        job["status"] = "finished"
+        job["percent"] = 100
+        job["filepath"] = final_path
+
+    # Best-effort - the clip is already written and correct either way, so a
+    # locked/undeletable temp file (e.g. still scanned by AV) isn't fatal.
+    try:
+        os.remove(full_path)
+    except OSError:
+        pass
 
 
 def cancel_download(job_id):
@@ -635,37 +632,25 @@ def _extract_error_message(output_lines):
     return output_lines[-1].strip() if output_lines else None
 
 
-def _apply_progress_line(job_id, line, clip_duration=None):
+def _apply_progress_line(job_id, line):
     """Updates job progress fields from one line of yt-dlp output. Returns
-    True if the line carried real progress info - either a "[download] NN%"
-    line, or (when `clip_duration` is known) one of the "out_time=..." lines
-    ffmpeg emits when it's the one doing the download (see the
-    "--downloader-args ffmpeg_o:-progress pipe:1" flag in
-    _run_download_inner) - used by the caller to tell raw downloading apart
-    from later post-processing."""
+    True if the line carried a real "[download] NN%" progress update - used
+    by the caller to tell raw downloading apart from later post-processing."""
     match = _PROGRESS_RE.search(line)
-    ffmpeg_match = None
-    if not match and clip_duration:
-        ffmpeg_match = _FFMPEG_OUT_TIME_RE.match(line.strip())
     with _jobs_lock:
         job = jobs.get(job_id)
         if job is None:
-            return bool(match) or bool(ffmpeg_match)
+            return bool(match)
         if match:
             job["percent"] = float(match.group("percent"))
             job["speed"] = match.group("speed")
             job["eta"] = match.group("eta")
-        elif ffmpeg_match:
-            elapsed = _parse_ffmpeg_timestamp(ffmpeg_match)
-            job["percent"] = min(100.0, round(elapsed / clip_duration * 100, 1))
-            job["speed"] = None
-            job["eta"] = None
         merge_match = _MERGE_RE.search(line)
         if merge_match:
             job["filepath"] = merge_match.group("path")
         elif "Destination:" in line:
             job["filepath"] = line.split("Destination:", 1)[1].strip()
-    return bool(match) or bool(ffmpeg_match)
+    return bool(match)
 
 
 def get_job(job_id):
@@ -683,7 +668,9 @@ def run_self_update():
     update check didn't work")."""
     cmd = resolve_ytdlp_command() + ["-U"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+        )
     except subprocess.TimeoutExpired:
         return {"returncode": -1, "output": "Update check timed out after 120s."}
     except FileNotFoundError:

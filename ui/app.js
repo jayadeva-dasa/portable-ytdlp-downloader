@@ -11,10 +11,14 @@ const videoTitle = document.getElementById("video-title");
 const formatSelect = document.getElementById("format");
 const downloadBtn = document.getElementById("download");
 const progressCard = document.getElementById("progress-card");
+const progressView = document.getElementById("progress-view");
 const progressFill = document.getElementById("progress-fill");
 const progressBar = progressFill.parentElement;
 const progressText = document.getElementById("progress-text");
 const cancelBtn = document.getElementById("cancel");
+const resultView = document.getElementById("result-view");
+const resultText = document.getElementById("result-text");
+const resultRevealBtn = document.getElementById("result-reveal");
 const updateBtn = document.getElementById("update");
 const updateOutput = document.getElementById("update-output");
 const errorEl = document.getElementById("error");
@@ -142,14 +146,45 @@ function renderHistory() {
   }
   for (const entry of entries) {
     const li = document.createElement("li");
+    li.className = "history-item";
     const when = new Date(entry.timestamp).toLocaleString();
-    const clipNote = entry.clip ? ` <span class="muted">[clip ${entry.clip}]</span>` : "";
-    li.innerHTML = `<span class="status status-${entry.status}">${entry.status}</span> ${entry.title || entry.url}${clipNote} <span class="muted">(${when})</span>`;
-    const revealPathValue = entry.filepath || entry.outputDir;
-    if (revealPathValue) {
-      li.classList.add("clickable");
-      li.addEventListener("click", () => revealPath(revealPathValue));
+
+    const info = document.createElement("span");
+    info.className = "history-info";
+
+    const statusSpan = document.createElement("span");
+    statusSpan.className = `status status-${entry.status}`;
+    statusSpan.textContent = entry.status;
+    info.appendChild(statusSpan);
+
+    // Title/url come from yt-dlp metadata fetched from the target site, so
+    // it's untrusted - build the row with text nodes rather than innerHTML
+    // to avoid a stored-XSS vector from a malicious video title.
+    info.appendChild(document.createTextNode(` ${entry.title || entry.url}`));
+
+    if (entry.clip) {
+      const clipSpan = document.createElement("span");
+      clipSpan.className = "muted";
+      clipSpan.textContent = ` [clip ${entry.clip}]`;
+      info.appendChild(clipSpan);
     }
+
+    const whenSpan = document.createElement("span");
+    whenSpan.className = "muted";
+    whenSpan.textContent = ` (${when})`;
+    info.appendChild(whenSpan);
+
+    li.appendChild(info);
+
+    const revealBtn = document.createElement("button");
+    revealBtn.type = "button";
+    revealBtn.className = "icon-btn history-reveal-btn";
+    revealBtn.title = "Show in folder";
+    revealBtn.setAttribute("aria-label", "Show in folder");
+    revealBtn.textContent = "📁";
+    revealBtn.addEventListener("click", () => revealHistoryEntry(entry));
+    li.appendChild(revealBtn);
+
     historyList.appendChild(li);
   }
 }
@@ -207,16 +242,38 @@ browseFolderBtn.addEventListener("click", async () => {
   }
 });
 
-async function revealPath(path) {
+// Backs each History row's folder icon. Prefers the exact downloaded file
+// (entry.filepath); falls back to the chosen output folder (entry.outputDir)
+// for jobs that never resolved a specific file (e.g. a playlist run, or one
+// that errored/was cancelled before any file was written). Reveals through
+// the same /api/reveal endpoint - and so the same OS file-manager command -
+// used by the "Browse…" folder picker, so results are always consistent.
+async function revealHistoryEntry(entry) {
   clearError();
+  const target = entry.filepath || entry.outputDir;
+  if (!target) {
+    showError("No save location was recorded for this download.");
+    return;
+  }
   try {
     const res = await fetch("/api/reveal", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ path: target }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "Failed to reveal path");
+    if (!res.ok) {
+      if (res.status === 404) {
+        showError(
+          entry.filepath
+            ? "That file couldn't be found — it may have been moved, renamed, or deleted."
+            : "That folder couldn't be found — it may have been moved or deleted."
+        );
+      } else {
+        showError(data.error || "Failed to open file location");
+      }
+      return;
+    }
   } catch (err) {
     showError(err.message);
   }
@@ -420,6 +477,8 @@ fetchFormatsBtn.addEventListener("click", async () => {
   const showedSearchProgress = !currentJobId;
   if (showedSearchProgress) {
     progressCard.hidden = false;
+    progressView.hidden = false;
+    resultView.hidden = true;
     progressBar.classList.add("indeterminate");
     progressFill.style.removeProperty("width");
     progressText.textContent = "Searching for formats…";
@@ -509,6 +568,33 @@ const STATUS_LABELS = {
 };
 const TERMINAL_STATUSES = ["finished", "error", "cancelled", "not_found"];
 
+// A finished/failed/cancelled job used to just leave the progress bar frozen
+// at 100% with a "Finished" label forever - this swaps the progress card
+// over to a compact result view instead, with a reveal-in-folder icon for a
+// successful download. Starting a new download (downloadBtn's click
+// handler) swaps back to the progress view - there's always exactly one
+// view showing in the card, never both stacked.
+const RESULT_MESSAGES = {
+  finished: "✅ Download finished.",
+  cancelled: "⏹️ Download cancelled.",
+  not_found: "This download is no longer tracked (the server may have restarted).",
+};
+
+function showDownloadResult(job, outputDir) {
+  progressView.hidden = true;
+  resultView.hidden = false;
+  resultText.textContent =
+    job.status === "error"
+      ? `❌ ${job.error || "Download failed."}`
+      : RESULT_MESSAGES[job.status] || STATUS_LABELS[job.status] || job.status;
+
+  const revealTarget = job.status === "finished" && (job.filepath || outputDir);
+  resultRevealBtn.hidden = !revealTarget;
+  if (revealTarget) {
+    resultRevealBtn.onclick = () => revealHistoryEntry({ filepath: job.filepath, outputDir });
+  }
+}
+
 // Some qualities (confirmed: HLS-only 4K formats) make yt-dlp hand the
 // transfer off to ffmpeg directly instead of its usual fragment-by-fragment
 // downloader - that path never prints a "[download] NN%" line at all, so
@@ -542,6 +628,8 @@ downloadBtn.addEventListener("click", async () => {
 
   downloadBtn.disabled = true;
   progressCard.hidden = false;
+  progressView.hidden = false;
+  resultView.hidden = true;
   progressBar.classList.remove("indeterminate");
   progressFill.style.width = "0%";
   progressText.textContent = `${STATUS_LABELS.starting}…`;
@@ -638,6 +726,7 @@ downloadBtn.addEventListener("click", async () => {
         downloadTabBadge.hidden = true;
         updateLastHistoryEntry(data.job_id, { status: job.status });
         if (job.status === "error") showError(job.error || "Download failed");
+        showDownloadResult(job, data.output_dir);
       }
     };
     source.onerror = () => {

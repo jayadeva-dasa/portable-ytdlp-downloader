@@ -84,10 +84,16 @@
       </div>
 
       <div class="card" id="progress-card" hidden>
-        <div class="progress-bar"><div id="progress-fill"></div></div>
-        <div class="row space-between">
-          <p id="progress-text">Starting…</p>
-          <button id="cancel" class="secondary">Cancel</button>
+        <div id="progress-view">
+          <div class="progress-bar"><div id="progress-fill"></div></div>
+          <div class="row space-between">
+            <p id="progress-text">Starting…</p>
+            <button id="cancel" class="secondary">Cancel</button>
+          </div>
+        </div>
+        <div class="row space-between" id="result-view" hidden>
+          <p id="result-text"></p>
+          <button id="result-reveal" class="icon-btn" title="Show in folder" aria-label="Show in folder" hidden>📁</button>
         </div>
       </div>
     </section>

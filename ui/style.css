@@ -390,7 +390,8 @@ select:focus-visible {
   }
 }
 
-#progress-text {
+#progress-text,
+#result-text {
   margin: 0;
   font-size: 0.9rem;
 }
@@ -431,13 +432,22 @@ pre {
   border-bottom: none;
 }
 
-.clickable {
-  cursor: pointer;
-  border-radius: 6px;
+.history-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
 }
 
-.clickable:hover {
-  background: var(--hover);
+.history-info {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.history-reveal-btn {
+  flex-shrink: 0;
+  padding: 0.25rem 0.45rem;
+  font-size: 0.9rem;
 }
 
 .muted {

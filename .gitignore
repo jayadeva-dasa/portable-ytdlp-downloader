@@ -13,3 +13,6 @@ ffmpeg/*
 build/
 dist/
 *.spec
+
+# Debug log written by app/ytdlp_manager.py's _log()
+logs/
