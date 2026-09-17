@@ -42,6 +42,9 @@ jobs:
       - name: Fetch yt-dlp binary for this OS
         run: python scripts/fetch_binaries.py --current-os
 
+      - name: Fetch ffmpeg/ffprobe for this OS
+        run: python scripts/fetch_ffmpeg.py
+
       - name: Build executable
         run: python scripts/build.py
 

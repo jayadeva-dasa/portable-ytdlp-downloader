@@ -43,7 +43,25 @@ what's stale and needs re-checking before it's trusted.
   missing ffmpeg — was buried in output the UI never showed.)
 - **`scripts/fetch_ffmpeg.py`** — downloads static ffmpeg/ffprobe binaries
   into `ffmpeg/`, mirroring `scripts/fetch_binaries.py`'s pattern for
-  yt-dlp itself. Already wired into `scripts/build.py`'s PyInstaller bundle.
+  yt-dlp itself. `scripts/build.py` bundles whatever is already in `ffmpeg/`
+  into the PyInstaller output, but does not run `fetch_ffmpeg.py` itself —
+  the caller must run it first. **Incident (2026-09):** every OS's released
+  zip from `.github/workflows/release.yml` shipped with an empty `ffmpeg/`
+  (just `.gitkeep`) because the workflow called `fetch_binaries.py
+  --current-os` for yt-dlp but never called `fetch_ffmpeg.py`. Symptom
+  looked nothing like a missing-ffmpeg error: yt-dlp merges video+audio via
+  its own ffmpeg postprocessing step, so with no ffmpeg available (bundled
+  dir empty and none on PATH) it silently left the separate video-only and
+  audio-only streams on disk instead of one merged file — video-only stream
+  fails to play, indistinguishable at a glance from a download bug. Fixed
+  by adding a "Fetch ffmpeg/ffprobe for this OS" step (`python
+  scripts/fetch_ffmpeg.py`) to the release workflow for all three OS
+  matrix entries, right after the yt-dlp fetch step and before
+  `scripts/build.py`. Any other place that packages a distributable build
+  (a future local packaging script, a different CI workflow) must call
+  `fetch_ffmpeg.py` before `build.py` too — `build.py` bundles `ffmpeg/`
+  as-is and has no way to tell an intentionally-empty dev checkout apart
+  from a checkout that forgot this step.
 - **Toolbar + tabs UI redesign** — sticky toolbar (brand + dark-mode toggle),
   Download/History tabs, empty state — `ui/index.html`, `ui/style.css`,
   `ui/app.js` (`switchTab`, `tabButtons`/`tabPanels`).
